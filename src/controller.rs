@@ -1,5 +1,5 @@
 use crate::docker_secret::DockerConfigJson;
-use crate::{Error, Result};
+use crate::{services::ServiceWatcher, Error, Result};
 use anyhow::bail;
 use futures::StreamExt;
 use handlebars::Handlebars;
@@ -40,11 +40,12 @@ pub const K8S_HOST_TAG: &str = "kubernetes";
 /// wasmCloud custom label for controlling routing
 pub const WASMCLOUD_ROUTE_TO_LABEL: &str = "wasmcloud.dev/route-to";
 
-#[derive(Clone)]
+//#[derive(Clone)]
 pub struct Context {
     pub client: Client,
     pub wasmcloud_config: WasmcloudConfig,
     pub nats_creds: Arc<RwLock<HashMap<NameNamespace, SecretString>>>,
+    service_watcher: ServiceWatcher,
 }
 
 #[derive(Clone, Default)]
@@ -811,18 +812,22 @@ pub async fn run(state: State) -> anyhow::Result<()> {
     let cms = Api::<ConfigMap>::all(client.clone());
     let deployments = Api::<Deployment>::all(client.clone());
     let secrets = Api::<Secret>::all(client.clone());
+    let services = Api::<Service>::all(client.clone());
 
+    let watcher = ServiceWatcher::new(client.clone());
     let config = Config::default();
     let ctx = Context {
         client,
         wasmcloud_config: state.config.clone(),
         nats_creds: state.nats_creds.clone(),
+        service_watcher: watcher,
     };
 
     Controller::new(configs, watcher::Config::default())
         .owns(cms, watcher::Config::default())
         .owns(deployments, watcher::Config::default())
         .owns(secrets, watcher::Config::default())
+        .owns(services, watcher::Config::default())
         .with_config(config)
         .shutdown_on_signal()
         .run(reconcile, error_policy, Arc::new(ctx))
