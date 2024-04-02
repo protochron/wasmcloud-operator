@@ -27,6 +27,7 @@ use wadm::{
 };
 
 const CONSUMER_PREFIX: &str = "wasmcloud_operator_service";
+const WADM_EVT_SUBJECT: &str = "wadm.evt";
 
 #[derive(Clone, Debug)]
 enum WatcherCommand {
@@ -150,14 +151,18 @@ impl Watcher {
     }
 
     fn handle_manifest_unpublished(&self, mu: ManifestUnpublished) -> Result<()> {
+        self.tx
+            .try_send(WatcherCommand::RemoveService {
+                name: mu.name,
+                namespace: self.namespace.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("Error sending command to watcher: {}", e))?;
         Ok(())
     }
 }
 
 pub struct ServiceWatcher {
-    k8s_client: KubeClient,
     watchers: Arc<RwLock<HashMap<String, Watcher>>>,
-    //receiver: mpsc::Receiver<WatcherCommand>,
     sender: mpsc::Sender<WatcherCommand>,
 }
 
@@ -197,7 +202,6 @@ impl ServiceWatcher {
         });
 
         Self {
-            k8s_client,
             watchers: Arc::new(RwLock::new(HashMap::new())),
             sender: tx,
         }
@@ -210,7 +214,7 @@ impl ServiceWatcher {
         }
 
         let js = jetstream::new(client.clone());
-        let subject = format!("wadm.evt.{}", lattice_id.clone());
+        let subject = format!("{WADM_EVT_SUBJECT}.{}", lattice_id.clone());
         let stream = js
             .get_stream(wadm::consumers::EVENTS_CONSUMER_PREFIX)
             .await

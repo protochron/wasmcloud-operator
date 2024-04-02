@@ -1,5 +1,7 @@
-use crate::docker_secret::DockerConfigJson;
-use crate::{services::ServiceWatcher, Error, Result};
+use crate::{
+    docker_secret::DockerConfigJson, resources::application::get_client, services::ServiceWatcher,
+    Error, Result,
+};
 use anyhow::bail;
 use futures::StreamExt;
 use handlebars::Handlebars;
@@ -28,7 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::str::from_utf8;
 use std::sync::Arc;
 use tokio::{sync::RwLock, time::Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wasmcloud_operator_types::v1alpha1::{
     AppStatus, WasmCloudHostConfig, WasmCloudHostConfigStatus,
 };
@@ -178,7 +180,7 @@ async fn reconcile_crd(config: &WasmCloudHostConfig, ctx: Arc<Context>) -> Resul
             version: a.version.clone(),
         })
         .collect::<Vec<AppStatus>>();
-    info!("Found apps: {:?}", app_names);
+    debug!("Found apps: {:?}", app_names);
     cfg.status = Some(WasmCloudHostConfigStatus {
         apps: app_names.clone(),
         app_count: app_names.len() as u32,
@@ -196,6 +198,26 @@ async fn reconcile_crd(config: &WasmCloudHostConfig, ctx: Arc<Context>) -> Resul
             e
         })?;
 
+    // Start the watcher so that services are automatically created in the cluster.
+    let nats_client = get_client(
+        &cfg.spec.nats_address,
+        ctx.nats_creds.clone(),
+        NameNamespace::new(name.clone(), ns.clone()),
+    )
+    .await
+    .map_err(|e| {
+        warn!("Failed to get nats client: {}", e);
+        Error::NatsError(format!("Failed to get nats client: {}", e))
+    })?;
+
+    ctx.service_watcher
+        .watch(nats_client, ns.clone(), cfg.spec.lattice.clone())
+        .await
+        .map_err(|e| {
+            warn!("Failed to start service watcher: {}", e);
+            Error::NatsError(format!("Failed to watch services: {}", e))
+        })?;
+
     Ok(Action::requeue(Duration::from_secs(5 * 60)))
 }
 
@@ -207,6 +229,13 @@ async fn cleanup(config: &WasmCloudHostConfig, ctx: Arc<Context>) -> Result<Acti
 
     let nst = NameNamespace::new(name.clone(), ns.clone());
     ctx.nats_creds.write().await.remove(&nst);
+    ctx.service_watcher
+        .stop_watch(config.spec.lattice.clone())
+        .await
+        .map_err(|e| {
+            warn!("Failed to stop service watcher: {}", e);
+            Error::NatsError(format!("Failed to stop service watcher: {}", e))
+        })?;
 
     Ok(Action::await_change())
 }

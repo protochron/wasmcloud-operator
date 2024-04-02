@@ -83,7 +83,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 utoipa = { version = "4.1", features = ["axum_extras"] }
 uuid = { version = "1", features = ["v5"] }
 wadm = "0.10"
-wash-lib = "0.19"
+wash-lib = "0.17"
 wasmcloud-operator-types = { version="*", path = "./crates/types" }
 
 [workspace]
