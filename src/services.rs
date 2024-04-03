@@ -4,6 +4,7 @@ use async_nats::{
     jetstream,
     jetstream::{
         consumer::{pull::Config, Consumer},
+        stream::{Config as StreamConfig, RetentionPolicy, Source, StorageType},
         AckKind,
     },
     Client,
@@ -28,6 +29,7 @@ use wadm::{
 
 const CONSUMER_PREFIX: &str = "wasmcloud_operator_service";
 const WADM_EVT_SUBJECT: &str = "wadm.evt";
+const OPERATOR_STREAM_NAME: &str = "wasmcloud_operator_events";
 
 #[derive(Clone, Debug)]
 enum WatcherCommand {
@@ -92,15 +94,24 @@ impl Watcher {
         let mut messages = consumer.stream().messages().await?;
         while let Some(message) = messages.next().await {
             if let Ok(message) = message {
-                message
-                    .ack_with(AckKind::Progress)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                //message
+                //    .ack_with(AckKind::Progress)
+                //    .await
+                //    .map_err(|e| anyhow::anyhow!(e))?;
 
-                let _ = self.handle_event(message.clone()).map_err(|e| {
-                    error!("Error handling event: {}", e);
-                });
-                message.ack().await.map_err(|e| anyhow::anyhow!(e))?;
+                //let _ = self.handle_event(message.clone()).map_err(|e| {
+                //    error!("Error handling event: {}", e);
+                //});
+                match self.handle_event(message.clone()) {
+                    Ok(_) => message.ack().await.map_err(|e| anyhow::anyhow!(e))?,
+                    Err(e) => {
+                        error!("Error handling event: {}", e);
+                        message
+                            .ack_with(AckKind::Nak(None))
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                    }
+                }
             }
         }
         Ok(())
@@ -131,10 +142,14 @@ impl Watcher {
     }
 
     fn handle_manifest_published(&self, mp: ManifestPublished) -> Result<()> {
+        debug!("Handling manifest published event: {:?}", mp);
         let manifest = mp.manifest;
         if let Some(httpserver_service) = http_server_component(&manifest) {
+            debug!("Found httpserver component: {}", httpserver_service);
             if let Some(address) = find_address(&manifest, httpserver_service.as_str()) {
+                debug!("Found address: {}", address);
                 if let Ok(addr) = address.parse::<SocketAddr>() {
+                    debug!("Upserting service for manifest: {}", manifest.metadata.name);
                     self.tx
                         .try_send(WatcherCommand::UpsertService {
                             name: manifest.metadata.name.clone(),
@@ -215,10 +230,28 @@ impl ServiceWatcher {
 
         let js = jetstream::new(client.clone());
         let subject = format!("{WADM_EVT_SUBJECT}.{}", lattice_id.clone());
+
+        // TODO should any of this be configurable?
+        // Should we also be doing this when we first create the ServiceWatcher?
         let stream = js
-            .get_stream(wadm::consumers::EVENTS_CONSUMER_PREFIX)
-            .await
-            .unwrap();
+            .get_or_create_stream(StreamConfig {
+                name: OPERATOR_STREAM_NAME.to_string(),
+                description: Some(
+                    "Stream for wadm events consumed by the wasmCloud K8s Operator".to_string(),
+                ),
+                max_age: wadm::DEFAULT_EXPIRY_TIME,
+                retention: RetentionPolicy::WorkQueue,
+                storage: StorageType::File,
+                allow_rollup: false,
+                num_replicas: 1,
+                mirror: Some(Source {
+                    name: "wadm_events".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
+
         let consumer_name = format!("{CONSUMER_PREFIX}-{}", lattice_id.clone());
         let consumer = stream
         .get_or_create_consumer(
@@ -262,6 +295,9 @@ pub async fn create_or_update_service(
 ) -> Result<()> {
     let api = Api::<Service>::namespaced(k8s_client.clone(), namespace);
 
+    // TODO add label selector for the right wasmcloud pods in this namespace, ensure the ip
+    // address is ipv4 or ipv6 based on what the address says in the manifest
+    // Basically just ensure we can call the service and hit the right component
     let mut svc = Service {
         metadata: kube::api::ObjectMeta {
             name: Some(name.to_string()),
@@ -297,7 +333,8 @@ pub async fn create_or_update_service(
 pub fn http_server_component(manifest: &Manifest) -> Option<String> {
     for component in manifest.spec.components.iter() {
         if let wadm::model::Properties::Capability { properties } = &component.properties {
-            if properties.contract == "httpserver" {
+            debug!("Properties: {:?}", properties);
+            if properties.contract == "wasmcloud:httpserver" {
                 return Some(component.name.clone());
             }
         }
